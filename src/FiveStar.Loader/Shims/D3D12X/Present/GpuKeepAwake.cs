@@ -44,15 +44,27 @@ internal static unsafe class GpuKeepAwake
         [numthreads(64, 1, 1)]
         void main(uint3 id : SV_DispatchThreadID) {
             uint x = id.x;
-            [loop] for (uint i = 0; i < 400000u; i++) x = x * 1664525u + 1013904223u;
+            [loop] for (uint i = 0; i < COUNT; i++) x = x * 1664525u + 1013904223u;
             sum.Store(id.x * 4u, x);
         }
         """;
 
+    /// <summary>Iterations of the counting loop by default: about 2 ms at full clocks.</summary>
+    public const int DefaultLoopCount = 400_000;
+
+    /// <summary>How long <see cref="Stop"/> waits for the thread and the dispatches it sent.</summary>
+    private const int StopMilliseconds = 30_000;
+
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
+    private static readonly object Gate = new();
     private static long _last;
     private static long _sent;
     private static int _started;
+    private static Thread? _thread;
+    private static volatile bool _stopping;
+
+    /// <summary>Iterations of the counting loop (a test makes it short: WARP runs it on the CPU).</summary>
+    internal static int LoopCount { get; set; } = DefaultLoopCount;
 
     /// <summary>Off, on, or on and off by turns.</summary>
     public static GpuKeepAwakeMode Mode { get; set; }
@@ -117,11 +129,41 @@ internal static unsafe class GpuKeepAwake
         return now / TurnMilliseconds % TurnKinds == 1;
     }
 
+    /// <summary>
+    /// Stops the thread, once the dispatches it sent have run, and lets go of its queue and its reference to the device;
+    /// a later submission starts it again. The device factory calls it as its device goes: holding the device kept the
+    /// test runner's WARP device, and all a test left on it, alive to the end of the run (E_OUTOFMEMORY at later tests'
+    /// device creation on CI).
+    /// </summary>
+    public static void Stop()
+    {
+        lock (Gate)
+        {
+            var thread = _thread;
+
+            if (thread is null)
+            {
+                return;
+            }
+
+            _stopping = true;
+            thread.Join(StopMilliseconds);
+            _thread = null;
+            _stopping = false;
+            Interlocked.Exchange(ref _last, 0);
+            Interlocked.Exchange(ref _started, 0);
+        }
+    }
+
     private static void Start(nint device)
     {
-        Marshal.AddRef(device);
-        var desktop = new ID3D12Device(device);
-        new Thread(() => Run(desktop)) { IsBackground = true, Name = "fivestar gpu keep-awake" }.Start();
+        lock (Gate)
+        {
+            Marshal.AddRef(device);
+            var desktop = new ID3D12Device(device);
+            _thread = new Thread(() => Run(desktop)) { IsBackground = true, Name = "fivestar gpu keep-awake" };
+            _thread.Start();
+        }
     }
 
     private static void Run(ID3D12Device device)
@@ -133,6 +175,10 @@ internal static unsafe class GpuKeepAwake
         catch (Exception exception) when (exception is SharpGen.Runtime.SharpGenException or InvalidOperationException)
         {
             ShimContext.Runtime.Log.Warn($"[gpu awake] the GPU is not kept awake: {exception.Message}");
+        }
+        finally
+        {
+            device.Dispose();
         }
     }
 
@@ -157,7 +203,7 @@ internal static unsafe class GpuKeepAwake
         ShimContext.Runtime.Log.Info($"  [gpu awake] a compute queue keeps the GPU busy while the game submits ({Mode})");
         ulong value = 0;
 
-        while (true)
+        while (!_stopping)
         {
             if (!Wanted(Clock.ElapsedMilliseconds, Interlocked.Read(ref _last), Mode))
             {
@@ -181,12 +227,19 @@ internal static unsafe class GpuKeepAwake
             queue.Signal(fence, value).CheckError();
             Interlocked.Increment(ref _sent);
         }
+
+        // What was sent runs before the queue and the resources go.
+        if (fence.CompletedValue < value)
+        {
+            fence.SetEventOnCompletion(value, completed.SafeWaitHandle.DangerousGetHandle()).CheckError();
+            completed.WaitOne(StopMilliseconds);
+        }
     }
 
     /// <summary>The counting program, compiled with d3dcompiler_47 as the indirect clamp's is.</summary>
     private static byte[] Compile()
     {
-        byte[] source = Encoding.ASCII.GetBytes(Source);
+        byte[] source = Encoding.ASCII.GetBytes(string.Create(System.Globalization.CultureInfo.InvariantCulture, $"#define COUNT {LoopCount}u\n{Source}"));
         byte[] entry = Encoding.ASCII.GetBytes("main\0");
         byte[] target = Encoding.ASCII.GetBytes("cs_5_1\0");
         byte[] name = Encoding.ASCII.GetBytes("gpu_keep_awake\0");

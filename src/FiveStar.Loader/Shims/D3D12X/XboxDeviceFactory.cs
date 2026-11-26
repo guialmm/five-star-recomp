@@ -485,6 +485,8 @@ internal sealed unsafe class XboxDeviceFactory : IDisposable
 
     public void Dispose()
     {
+        // Our own GPU work goes first: its queue holds the device.
+        Present.GpuKeepAwake.Stop();
         _log.Info($"  [d3d12_xs] {ListSubmissions.Summary}");
         _log.Info($"  [d3d12_xs] {Bindings.Layouts.Summary}");
 

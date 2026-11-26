@@ -36,6 +36,9 @@ public sealed class GpuKeepAwakeTests
     {
         using var test = TestRuntime.Create();
         using var gpu = GpuDevice.CreateWarp(debugLayer: false);
+
+        // WARP runs the counting loop on the CPU: a short one.
+        GpuKeepAwake.LoopCount = ShortLoop;
         GpuKeepAwake.Mode = GpuKeepAwakeMode.On;
 
         try
@@ -52,10 +55,15 @@ public sealed class GpuKeepAwakeTests
         }
         finally
         {
+            // The thread, its queue and its reference to the device go before the device does: kept, it held the runner's
+            // WARP device for the rest of the run (E_OUTOFMEMORY at later tests' device creation on CI).
+            GpuKeepAwake.Stop();
             GpuKeepAwake.Mode = GpuKeepAwakeMode.Off;
+            GpuKeepAwake.LoopCount = GpuKeepAwake.DefaultLoopCount;
         }
     }
 
     private const int LongestSeconds = 30;
     private const int StepMilliseconds = 10;
+    private const int ShortLoop = 1_000;
 }
